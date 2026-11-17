@@ -1,0 +1,387 @@
+version: "3.8"
+
+# =============================================================================
+#  Agent Canvas + agenci ACP + Forgejo — WERSJA 4 (stan zgodny ze Swarmem)
+#  17.11.2026
+#
+#  CO ZMIENIONO WZGLEDEM v3 (na podstawie raportu porownania devstack.yml
+#  vs stack "dev"):
+#
+#  1. agent-canvas: obraz podniesiony 1.33.0 -> 1.40.0, przypiety do digestu
+#     dokladnie tak, jak dziala w Swarmie:
+#     ghcr.io/openhands/agent-canvas:1.40.0@sha256:ee597081...
+#
+#  2. forgejo: baza wrocila na pgdog -> GITEA__database__HOST=core_pgdog:6432
+#     (wczesniej tymczasowo core_pg-primary:5432, bo pgdog nie znal map
+#     uzytkownika/database — mapy sa juz dodane, wiec wracamy przez pooler).
+#
+#  3. forgejo: dodane zmienne reverse-proxy / auth-proxy (bylo w Swarmie,
+#     brakowalo w pliku):
+#       GITEA__security__REVERSE_PROXY_LIMIT=1
+#       GITEA__security__REVERSE_PROXY_TRUSTED_PROXIES=...
+#       GITEA__service__ENABLE_REVERSE_PROXY_AUTHENTICATION / _AUTO_REGISTRATION
+#       GITEA__service__REVERSE_PROXY_AUTHENTICATION_USER=Remote-User
+#     Czyli logowanie idzie przez Authelie (naglowek Remote-User),
+#     a rejestracja lokalna pozostaje wylaczona (DISABLE_REGISTRATION=true).
+#
+#  4. aider-acp i goose-acp: w Swarmie maja teraz replicas=0 (reczne
+#     "docker service scale"). W pliku CELOWO zostaje replicas: 1, bo plik
+#     opisuje stan docelowy, a nie chwilowy. Zeby zrownac Swarm z plikiem:
+#       docker service scale dev_aider-acp=1 dev_goose-acp=1
+#     (albo, jesli te agenty maja byc wylaczone na stale, zmien replicas: 0
+#     tutaj i zrob "docker stack deploy" ponownie)
+#
+#  UWAGA (swiadoma decyzja): nie ma budzika ACP. Jesli agent jest uspiony,
+#  a Canvas sprobuje otworzyc ACP, dostanie blad — trzeba najpierw wejsc na
+#  strone agenta (to go budzi). Kolejnosc: strona -> poczekaj -> ACP.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Agent Canvas (UI + Agent Server) — usypiany po 24 h bez HTTP
+  # ---------------------------------------------------------------------------
+  agent-canvas:
+    image: ghcr.io/openhands/agent-canvas:1.40.0@sha256:ee59708177e8daa2702c88bf85107e738768a0ea72d37e0232ff71661ded07d1
+    environment:
+      PATH: /bootstrap:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      LOCAL_BACKEND_API_KEY: "oh-canvas-K9x4mQpL7vW2nRjT8sYdE3bA6cFhU0iZ"
+      OH_SECRET_KEY: "oh-secret-Xr5tNw8qJ1yBvP4mS7gD2kL0aEfC6hUz"
+      LLM_API_KEY: "sk-litellm-master-key-1234"
+      FORGEJO_TOKEN: "c4c867c5cf8ff38df1a75b5adbfc3def40e78c9b"
+      LLM_MODEL: "litellm_proxy/gpt-4o"
+      LLM_BASE_URL: "https://litellm.74cky.dedyn.io/v1"
+      FORGEJO_HOST: "https://git.74cky.dedyn.io/"
+      TMUX_TMPDIR: /tmp
+      FILE_STORE: local
+      AGENT_CANVAS_DISABLE_TELEMETRY: "true"
+      LOG_JSON: "true"
+    volumes:
+      - type: bind
+        source: /mnt/docker-data/nfs/devtools-data/openhands/state
+        target: /home/openhands/.openhands
+      - type: bind
+        source: /mnt/docker-data/nfs/devtools-data/projects
+        target: /projects
+      - type: bind
+        source: /mnt/docker-data/nfs/devtools-data/openhands/acp-bootstrap
+        target: /bootstrap
+        read_only: true
+    networks:
+      openhands-net:
+        aliases:
+          - agent-canvas
+      # core_proxy_net jest potrzebna, zeby core_nginx (stack "core")
+      # rozwiazywal nazwe agent-canvas. Bez tego vhost dostaje
+      # "no resolver defined" / 502 — nginx nie jest w sieci openhands-net.
+      core_proxy_net: {}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/ >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    stop_grace_period: 30s
+    deploy:
+      replicas: 1
+      labels:
+        sablier.enable: "true"
+        sablier.group: "canvas"
+      restart_policy:
+        condition: any
+        delay: 5s
+        window: 60s
+      update_config:
+        order: stop-first
+        failure_action: rollback
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
+        reservations:
+          cpus: "1.0"
+          memory: 2G
+      placement:
+        constraints:
+          - node.platform.os == linux
+
+  # ---------------------------------------------------------------------------
+  # OpenCode (ACP 7000 + web UI 4096) — 24 h
+  # Alias "opencode" zachowuje nazwe uzywana przez Canvas.
+  # ---------------------------------------------------------------------------
+  opencode-acp:
+    image: ghcr.io/pilinux/opencode:latest@sha256:dcc61257999212f4c9c5cbf2d6929806455dab32774f690d4bf3477e71371636
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/bootstrap/opencode-agent-entrypoint.sh"]
+    environment:
+      LITELLM_BASE_URL: "https://litellm.74cky.dedyn.io/v1"
+      LITELLM_API_KEY: "sk-litellm-master-key-1234"
+      OPENCODE_WEB_PASSWORD: ""
+      ACP_PORT: "7000"
+      WEB_PORT: "4096"
+      # Web UI startuje jako inny uzytkownik niz root i nie moze pisac do /root
+      # ("PermissionDenied: FileSystem.open /root/.local/share/opencode/log").
+      # Przekierowujemy katalogi XDG do /tmp (zapisywalny dla wszystkich).
+      HOME: "/tmp"
+      XDG_DATA_HOME: "/tmp/.local/share"
+      XDG_CACHE_HOME: "/tmp/.cache"
+      XDG_CONFIG_HOME: "/tmp/.config"
+    volumes:
+      - type: bind
+        source: /mnt/docker-data/nfs/devtools-data/projects
+        target: /projects
+      - type: bind
+        source: /mnt/docker-data/nfs/devtools-data/openhands/state
+        target: /agent-state
+      - type: bind
+        source: /mnt/docker-data/nfs/devtools-data/openhands/acp-bootstrap
+        target: /bootstrap
+        read_only: true
+    networks:
+      openhands-net:
+        aliases:
+          - opencode-acp
+          - opencode          # <- ta nazwa jest w konfiguracji Canvasa
+      core_proxy_net: {}
+    stop_grace_period: 15s
+    deploy:
+      replicas: 1
+      labels:
+        sablier.enable: "true"
+        sablier.group: "opencode"
+      restart_policy:
+        condition: any
+        delay: 5s
+      update_config:
+        order: stop-first
+        failure_action: rollback
+      placement:
+        constraints:
+          - node.platform.os == linux
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+  # ---------------------------------------------------------------------------
+  # AiderDesk (ACP 7000 + relay web 24338) — 24 h
+  # ---------------------------------------------------------------------------
+  aider-acp:
+    image: node:24-bookworm-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/bootstrap/aider-agent-entrypoint.sh"]
+    environment:
+      LITELLM_BASE_URL: "https://litellm.74cky.dedyn.io/v1"
+      LITELLM_API_KEY: "sk-litellm-master-key-1234"
+      AIDER_DESK_PORT: "24337"
+      AIDERDESK_MODEL: "gpt-4o"
+      ACP_PORT: "7000"
+      WEB_RELAY_PORT: "24338"
+      AIDERDESK_VERSION: "0.88.0"
+    volumes:
+      - type: bind
+        source: /mnt/docker-data/nfs/devtools-data/projects
+        target: /projects
+      - type: bind
+        source: /mnt/docker-data/nfs/devtools-data/openhands/state
+        target: /agent-state
+      - type: bind
+        source: /mnt/docker-data/nfs/devtools-data/openhands/acp-bootstrap
+        target: /bootstrap
+        read_only: true
+    networks:
+      openhands-net:
+        aliases:
+          - aider-acp
+          - aider
+      core_proxy_net: {}
+    stop_grace_period: 15s
+    deploy:
+      # W Swarmie chwilowo 0 (reczne "docker service scale dev_aider-acp=0").
+      # Stan docelowy = 1. Jesli agent ma byc wylaczony na stale, ustaw 0.
+      replicas: 1
+      labels:
+        sablier.enable: "true"
+        sablier.group: "aider"
+      restart_policy:
+        condition: any
+        delay: 10s
+      update_config:
+        order: stop-first
+        failure_action: rollback
+      placement:
+        constraints:
+          - node.platform.os == linux
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+  # ---------------------------------------------------------------------------
+  # Goose (ACP 7000 + web UI 3000) — 24 h
+  # ---------------------------------------------------------------------------
+  goose-acp:
+    image: ghcr.io/aaif-goose/goose:v1.54.0@sha256:c8a6b66718fafc405055bb642ab1cccbb9a31ed76d1fbd1e4385d18c43cdb4d0
+    user: "0:0"
+    # Skrypt uzywa skladni bash (${x//...}, ${!x}), a /bin/sh w tym obrazie
+    # to dash -> "Bad substitution" w linii 40. Dlatego bash, nie sh.
+    entrypoint: ["/bin/bash", "/bootstrap/goose-agent-entrypoint.sh"]
+    environment:
+      LITELLM_BASE_URL: "https://litellm.74cky.dedyn.io/v1"
+      LITELLM_API_KEY: "sk-litellm-master-key-1234"
+      GOOSE_MODEL: "kolocode-nvidia/nemotron-3-ultra-550b-a55b:free"
+      GOOSE_WEB_AUTH_TOKEN: ""
+      GOOSE_WEB_PORT: "3000"
+      ACP_PORT: "7000"
+    volumes:
+      - type: bind
+        source: /mnt/docker-data/nfs/devtools-data/projects
+        target: /projects
+      - type: bind
+        source: /mnt/docker-data/nfs/devtools-data/openhands/state
+        target: /agent-state
+      - type: bind
+        source: /mnt/docker-data/nfs/devtools-data/openhands/acp-bootstrap
+        target: /bootstrap
+        read_only: true
+    networks:
+      openhands-net:
+        aliases:
+          - goose-acp
+          - goose
+      core_proxy_net: {}
+    stop_grace_period: 15s
+    deploy:
+      # W Swarmie chwilowo 0 (reczne "docker service scale dev_goose-acp=0").
+      # Stan docelowy = 1. Jesli agent ma byc wylaczony na stale, ustaw 0.
+      replicas: 1
+      labels:
+        sablier.enable: "true"
+        sablier.group: "goose"
+      restart_policy:
+        condition: any
+        delay: 5s
+      update_config:
+        order: stop-first
+        failure_action: rollback
+      placement:
+        constraints:
+          - node.platform.os == linux
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+  # ---------------------------------------------------------------------------
+  # Forgejo — baza przez pgdog (core_pgdog:6432), wygaszanie 2 h
+  # git.74cky.dedyn.io
+  # ---------------------------------------------------------------------------
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:8@sha256:1f7c844e1c723ba09411a31f9a3ef8f551e6d77c9ff4f200ef36b870e8c8a3d7
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - GITEA__database__DB_TYPE=postgres
+      # Przez pooler pgdog. Wymaga map w pgdogu:
+      #   [[users]]  name="forgejo"
+      #   [[databases]] name="gitea" user="forgejo"
+      # Gdy pgdog zglosi "password for user forgejo ... is wrong" / brak mapy,
+      # tymczasowo wroc na primary: core_pg-primary:5432
+      - GITEA__database__HOST=core_pgdog:6432
+      - GITEA__database__NAME=gitea
+      - GITEA__database__USER=forgejo
+      - GITEA__database__PASSWD_FILE=/run/secrets/forgejo_postgres_password
+      - GITEA__server__ROOT_URL=https://git.74cky.dedyn.io
+      - GITEA__server__DOMAIN=git.74cky.dedyn.io
+      - GITEA__server__SSH_DOMAIN=git.74cky.dedyn.io
+      - GITEA__server__SSH_PORT=2222
+      - GITEA__server__HTTP_PORT=3000
+      - GITEA__server__START_SSH_SERVER=false
+      - GITEA__security__INSTALL_LOCK=true
+      - GITEA__security__SECRET_KEY=Z2l0aHViLXRleHQtY29waWxvdC1zZWNyZXQta2V5LTIwMjY=
+      - GITEA__security__INTERNAL_TOKEN=Zm9yZ2VqbS1pbnRlcm5hbC10b2tlbi12MS1zZWNyZXQ=
+      # Za reverse-proxy (core_nginx) — bez tego Forgejo widzi IP nginx jako
+      # klienta i sekretny naglowek Remote-User nie jest honorowany.
+      - GITEA__security__REVERSE_PROXY_LIMIT=1
+      - GITEA__security__REVERSE_PROXY_TRUSTED_PROXIES=127.0.0.0/8,::1/128,10.0.5.0/24,10.0.7.0/24
+      - GITEA__service__DISABLE_REGISTRATION=true
+      # Logowanie przez Authelie: nginx przekazuje naglowek Remote-User,
+      # Forgejo ufa mu i zaklada konto przy pierwszym wejsciu.
+      - GITEA__service__ENABLE_REVERSE_PROXY_AUTHENTICATION=true
+      - GITEA__service__ENABLE_REVERSE_PROXY_AUTO_REGISTRATION=true
+      - GITEA__service__REVERSE_PROXY_AUTHENTICATION_USER=Remote-User
+    volumes:
+      # Dane leza na NFS montowanym na KAZDYM wezle — dlatego bind, nie wolumen.
+      # Układ katalogu (git/, gitea/, ssh/) to dokladnie zawartosc /data Forgejo.
+      - type: bind
+        source: /mnt/docker-data/nfs/devstack/forgejo
+        target: /data
+      - type: bind
+        source: /etc/timezone
+        target: /etc/timezone
+        read_only: true
+      - type: bind
+        source: /etc/localtime
+        target: /etc/localtime
+        read_only: true
+    ports:
+      # SSH. UWAGA: port publikowany na usludze usypianej. Gdy Forgejo spi,
+      # dostajesz "connection refused" — SSH NIE budzi (nie ma tam HTTP).
+      # Jesli SSH nie jest potrzebny, usun ten blok i ustaw
+      # GITEA__server__START_SSH_SERVER=false bez publikacji portu.
+      - target: 2222
+        published: 2222
+        protocol: tcp
+        mode: ingress
+    networks:
+      core_proxy_net:
+        aliases:
+          - forgejo
+      core_auth_net: {}
+      core_ha_postgres_proxy_net: {}
+    secrets:
+      - source: forgejo_postgres_password
+        target: forgejo_postgres_password
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    stop_grace_period: 30s
+    deploy:
+      replicas: 1
+      labels:
+        sablier.enable: "true"
+        sablier.group: "forgejo"
+      restart_policy:
+        condition: any
+        delay: 10s
+      update_config:
+        order: stop-first
+        failure_action: rollback
+      placement:
+        constraints:
+          - node.platform.os == linux
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+networks:
+  openhands-net:
+    driver: overlay
+    attachable: true
+  core_proxy_net:
+    external: true
+  core_auth_net:
+    external: true
+  core_ha_postgres_proxy_net:
+    external: true
+
+secrets:
+  # Sekret istnieje BEZ prefiksu stacku (utworzony recznie, nie przez compose):
+  #   docker secret ls | grep forgejo  ->  forgejo_postgres_password
+  forgejo_postgres_password:
+    external: true
+    name: forgejo_postgres_password
